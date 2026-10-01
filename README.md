@@ -48,3 +48,7 @@ export ICS2GCAL_ACCOUNT=you@example.com   # or an index like 1
 ```sh
 rm ~/.local/bin/ics2gcal ~/.local/share/applications/ics2gcal.desktop
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
