@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""ics2gcal - open .ics events as prefilled "new event" pages in Google Calendar.
+
+Usage: ics2gcal [--print] FILE.ics [FILE.ics ...]
+  --print   only print the URLs, don't open the browser
+
+Env:
+  ICS2GCAL_ACCOUNT   Google account to use (email or index, e.g. "1"),
+                     handy if you're signed into several accounts.
+"""
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import webbrowser
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import os
+
+GCAL = "https://calendar.google.com/calendar/render"
+MAX_DETAILS = 2000  # keep URLs well below Google's length limit
+
+# Outlook/Exchange invites often use Windows zone names
+WINDOWS_TZ = {
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Romance Standard Time": "Europe/Paris",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Central European Standard Time": "Europe/Warsaw",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "E. Europe Standard Time": "Europe/Bucharest",
+    "FLE Standard Time": "Europe/Kiev",
+    "Eastern Standard Time": "America/New_York",
+    "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "India Standard Time": "Asia/Kolkata",
+    "China Standard Time": "Asia/Shanghai",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "UTC": "UTC",
+    "Coordinated Universal Time": "UTC",
+}
+
+
+def notify(msg):
+    print(msg, file=sys.stderr)
+    # launched from a file manager there's no terminal, so also show a popup
+    if not sys.stderr.isatty():
+        try:
+            subprocess.run(["notify-send", "ics2gcal", msg], check=False)
+        except FileNotFoundError:
+            pass
+
+
+def split_prop(line):
+    """'NAME;P1=a;P2="x:y":value' -> ('NAME', {'P1': 'a', 'P2': 'x:y'}, 'value')"""
+    in_quote = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == ":" and not in_quote:
+            head, value = line[:i], line[i + 1:]
+            break
+    else:
+        return None
+    parts = re.findall(r'(?:[^;"]|"[^"]*")+', head)
+    name, params = parts[0].upper(), {}
+    for p in parts[1:]:
+        k, _, v = p.partition("=")
+        params[k.upper()] = v.strip('"')
+    return name, params, value
+
+
+def unescape(s):
+    return re.sub(r"\\([nN,;\\])", lambda m: "\n" if m.group(1) in "nN" else m.group(1), s)
+
+
+def parse_events(text):
+    text = re.sub(r"\r?\n[ \t]", "", text)  # unfold continuation lines
+    events, stack, cur = [], [], None
+    for line in text.splitlines():
+        prop = split_prop(line)
+        if not prop:
+            continue
+        name, params, value = prop
+        if name == "BEGIN":
+            stack.append(value.upper())
+            if value.upper() == "VEVENT":
+                cur = {}
+        elif name == "END":
+            if stack and stack.pop() == "VEVENT" and cur is not None:
+                events.append(cur)
+                cur = None
+        elif cur is not None and stack and stack[-1] == "VEVENT":
+            cur.setdefault(name, (params, value))  # first occurrence wins
+    return events
+
+
+def resolve_tz(tzid):
+    if not tzid:
+        return None
+    candidates = [tzid, tzid.lstrip("/"), WINDOWS_TZ.get(tzid)]
+    m = re.search(r"[A-Z][a-z]+/[A-Za-z_]+(?:/[A-Za-z_]+)?", tzid)
+    if m:
+        candidates.append(m.group(0))
+    for c in candidates:
+        if c:
+            try:
+                return ZoneInfo(c)
+            except Exception:
+                pass
+    notify(f"Unknown timezone '{tzid}', assuming local time")
+    return None
+
+
+def parse_dt(params, value):
+    """Returns a date (all-day) or an aware UTC datetime."""
+    value = value.strip()
+    if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", value):
+        return datetime.strptime(value[:8], "%Y%m%d").date()
+    dt = datetime.strptime(value.rstrip("Z")[:15], "%Y%m%dT%H%M%S")
+    if value.endswith("Z"):
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        tz = resolve_tz(params.get("TZID"))
+        dt = dt.replace(tzinfo=tz) if tz else dt.astimezone()  # floating -> local
+    return dt.astimezone(timezone.utc)
+
+
+def parse_duration(s):
+    m = re.fullmatch(r"([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", s.strip())
+    if not m:
+        return None
+    sign, w, d, h, mi, sec = m.groups()
+    td = timedelta(weeks=int(w or 0), days=int(d or 0), hours=int(h or 0),
+                   minutes=int(mi or 0), seconds=int(sec or 0))
+    return -td if sign == "-" else td
+
+
+def fmt(d):
+    if isinstance(d, datetime):
+        return d.strftime("%Y%m%dT%H%M%SZ")
+    return d.strftime("%Y%m%d")
+
+
+def event_url(ev):
+    if "DTSTART" not in ev:
+        raise ValueError("event has no DTSTART")
+    start = parse_dt(*ev["DTSTART"])
+    if "DTEND" in ev:
+        end = parse_dt(*ev["DTEND"])
+    elif "DURATION" in ev and parse_duration(ev["DURATION"][1]):
+        end = start + parse_duration(ev["DURATION"][1])
+    else:
+        end = start + timedelta(days=1) if not isinstance(start, datetime) else start + timedelta(hours=1)
+
+    q = {"action": "TEMPLATE", "dates": f"{fmt(start)}/{fmt(end)}"}
+    if "SUMMARY" in ev:
+        q["text"] = unescape(ev["SUMMARY"][1])
+    if "LOCATION" in ev:
+        q["location"] = unescape(ev["LOCATION"][1])
+    details = unescape(ev["DESCRIPTION"][1]) if "DESCRIPTION" in ev else ""
+    if "URL" in ev:
+        details = f"{ev['URL'][1]}\n\n{details}".strip()
+    if len(details) > MAX_DETAILS:
+        details = details[:MAX_DETAILS] + "\n[…truncated]"
+    if details:
+        q["details"] = details
+    if "RRULE" in ev:
+        q["recur"] = "RRULE:" + ev["RRULE"][1]
+    account = os.environ.get("ICS2GCAL_ACCOUNT")
+    if account:
+        q["authuser"] = account
+    return GCAL + "?" + urllib.parse.urlencode(q, quote_via=urllib.parse.quote)
+
+
+def main(argv):
+    only_print = "--print" in argv
+    files = [a for a in argv if a != "--print"]
+    if not files:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    urls = []
+    for path in files:
+        if path.startswith("file://"):
+            path = urllib.parse.unquote(urllib.parse.urlparse(path).path)
+        try:
+            with open(path, "rb") as f:
+                text = f.read().decode("utf-8", errors="replace")
+            if re.search(r"^METHOD:CANCEL", text, re.M | re.I):
+                notify(f"{os.path.basename(path)}: this is a cancellation, not an invite")
+            events = parse_events(text)
+            if not events:
+                notify(f"{os.path.basename(path)}: no events found")
+            for ev in events:
+                urls.append(event_url(ev))
+        except Exception as e:
+            notify(f"{os.path.basename(path)}: {e}")
+    for i, url in enumerate(urls):
+        if only_print:
+            print(url)
+        else:
+            if i:
+                time.sleep(0.3)  # let the browser open tabs in order
+            webbrowser.open_new_tab(url)
+    return 0 if urls else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

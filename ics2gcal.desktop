@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Add to Google Calendar
+Comment=Open .ics events as prefilled Google Calendar events
+Exec=ics2gcal %F
+Icon=x-office-calendar
+MimeType=text/calendar;
+Terminal=false
+Categories=Office;Calendar;
